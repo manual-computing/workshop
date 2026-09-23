@@ -115,3 +115,17 @@ export function buildPostReplayLiveAgentReattachReset(payload: string): string {
     ? `${RESET_TERMINAL_CURSOR_STYLE}${RESET_KITTY_KEYBOARD_PROTOCOL}`
     : POST_REPLAY_LIVE_AGENT_REATTACH_RESET
 }
+
+/** Snapshot proof main ships with an expired-checkpoint reattach replay. The
+ *  renderer's replay drain applies each field pane-aware (clear, source-grid
+ *  resize, kitty re-arm, post-replay reset, escape tail); absent means unknown
+ *  and the drain must keep it unproven rather than assume false/zero. */
+export type SshReattachModelReplayMeta = {
+  alternateScreen?: boolean
+  terminalOwner?: 'shell'
+  pendingEscapeTailAnsi?: string
+  kittyKeyboardFlags?: number
+  snapshotSeq?: number
+  snapshotCols?: number
+  snapshotRows?: number
+}

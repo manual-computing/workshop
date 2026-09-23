@@ -16,6 +16,7 @@ import {
 } from './pty-pre-handler-buffer'
 import type { createPtyOutputProcessor } from './pty-output-processor'
 import type { IpcPtyTransportOptions, PtyTransport } from './pty-transport-types'
+import type { SshReattachModelReplayMeta } from '../../../../shared/terminal-mode-reset-profiles'
 
 type PtyCallbacks = Parameters<PtyTransport['connect']>[0]['callbacks']
 
@@ -96,13 +97,15 @@ export function createIpcPtySessionHandlers({
   }
 
   function registerData(id: string): void {
-    const replay = (data: string): void => {
+    const replay = (data: string, meta?: SshReattachModelReplayMeta): void => {
       if (getPtyId() !== id) {
         return
       }
       const callbacks = getCallbacks()
       if (callbacks.onReplayData) {
-        callbacks.onReplayData(data)
+        // Why meta: the shared wire proof is a structural subset of the drain's
+        // meta — absent stays unproven, never a known-false the drain assumes.
+        callbacks.onReplayData(data, meta)
       } else {
         callbacks.onData?.(data)
       }

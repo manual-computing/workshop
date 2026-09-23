@@ -9,6 +9,8 @@ import {
 } from './terminal-tail-restore-seed'
 
 export class OrcaRuntimeWithSerializeMainTerminalBuffer extends OrcaRuntimeWithAttachRemoteTerminalSourceRangeConsumer {
+  /** Rebase the retained headless model onto the relay tail after an expired-checkpoint reattach.
+   *  The tail overlaps history, so it is painted (never swapped in) behind the live writeChain. */
   async restoreSshPtyModelReplay(ptyId: string, replay: string): Promise<void> {
     let state = this.headlessTerminals.get(ptyId)
     if (!state) {
@@ -20,13 +22,17 @@ export class OrcaRuntimeWithSerializeMainTerminalBuffer extends OrcaRuntimeWithA
     } else {
       const retained = state
       // The relay tail can overlap history; never replace the retained model with that bounded tail.
-      state.writeChain = state.writeChain.then(async () => {
-        if (this.headlessTerminals.get(ptyId) !== retained) {
-          return
-        }
-        retained.ownership.scan(replay)
-        await retained.emulator.write(`\x1b[2J\x1b[H${replay}`)
-      })
+      state.writeChain = state.writeChain
+        .then(async () => {
+          if (this.headlessTerminals.get(ptyId) !== retained) {
+            return
+          }
+          retained.ownership.scan(replay)
+          await retained.emulator.write(`\x1b[2J\x1b[H${replay}`)
+        })
+        .catch(() => {
+          // Best-effort: a raced teardown must not poison the chain live bytes chain behind.
+        })
     }
     await state.writeChain
     if (this.headlessTerminals.get(ptyId) === state) {

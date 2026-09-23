@@ -200,3 +200,21 @@ it.each([false, true])(
     expect(runtime.retainedState()).toEqual(EMPTY_RETAINED_STATE)
   }
 )
+
+it('paints the relay tail onto the retained model and keeps the chain usable after a raced write failure', async () => {
+  const runtime = createHydrationRuntime()
+  runtime.seedHeadlessTerminal(PTY_ID, 'SEED-', SIZE)
+  const state = runtime.model()
+  await state.writeChain
+  // A raced teardown rejects the restore write; the rejection arm must absorb
+  // it so the restore resolves and later links still parse.
+  vi.spyOn(state.emulator, 'write').mockRejectedValueOnce(new Error('raced-teardown'))
+  await expect(runtime.restoreSshPtyModelReplay(PTY_ID, 'TAIL')).resolves.toBeUndefined()
+  await runtime.restoreSshPtyModelReplay(PTY_ID, 'TAIL')
+  runtime.onPtyData(PTY_ID, 'LIVE', 1)
+  await state.writeChain
+  const visible = state.emulator.getVisibleLines().join('\n')
+  expect(visible).toContain('TAIL')
+  expect(visible).toContain('LIVE')
+  expect(runtime.retainedState().hydration).toBe('done')
+})

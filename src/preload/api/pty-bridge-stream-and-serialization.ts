@@ -3,6 +3,7 @@ import type { PtyModelRestoreNeededEvent } from '../../shared/pty-model-restore-
 import type { TerminalSideEffectBatch } from '../../shared/terminal-side-effect-facts'
 import type { PreloadApi } from '../api-types'
 import type { TerminalProcessInspection } from '../../shared/terminal-process-inspection'
+import type { SshReattachModelReplayMeta } from '../../shared/terminal-mode-reset-profiles'
 
 export const ptyStreamAndSerializationApi = {
   inspectProcess: (
@@ -45,9 +46,13 @@ export const ptyStreamAndSerializationApi = {
     ipcRenderer.on('pty:data', listener)
     return () => ipcRenderer.removeListener('pty:data', listener)
   },
-  onReplay: (callback: (data: { id: string; data: string }) => void): (() => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, data: { id: string; data: string }) =>
-      callback(data)
+  onReplay: (
+    callback: (data: { id: string; data: string; meta?: SshReattachModelReplayMeta }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      data: { id: string; data: string; meta?: SshReattachModelReplayMeta }
+    ) => callback(data)
     ipcRenderer.on('pty:replay', listener)
     return () => ipcRenderer.removeListener('pty:replay', listener)
   },

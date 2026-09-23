@@ -12,7 +12,7 @@ import { forgetRelayNodePtyRepairs, recoverRelayNodePtyForSpawn } from './ssh-re
 import type { TerminalUnavailableCause } from '../../shared/terminal-unavailable-cause'
 import {
   ABORT_TRUNCATED_CONTROL_STRING,
-  buildSnapshotReplayPrologue
+  type SshReattachModelReplayMeta
 } from '../../shared/terminal-mode-reset-profiles'
 import { DESKTOP_TERMINAL_SCROLLBACK_ROWS_MAX } from '../../shared/terminal-scrollback-policy'
 import { replayPendingSshPtyKills } from './ssh-pending-pty-kill-replay'
@@ -1751,7 +1751,6 @@ export class SshRelaySession {
       })
     )
   }
-
   // Why: shared by establish()/reconnect() so both paths reset renderer lists the same way.
   private broadcastEmptyLists(): void {
     const win = this.getMainWindow()
@@ -2311,6 +2310,11 @@ export class SshRelaySession {
     }
   }
 
+  /** Replay the missed tail after an expired-checkpoint reattach. Why data+meta
+   *  instead of composed bytes: the renderer's replay drain owns every
+   *  pane-conditional decision (clear, source-grid resize, kitty re-arm,
+   *  post-replay reset, escape tail), so main ships raw buffers plus the
+   *  snapshot's proof and never assumes which buffer the pane is on. */
   private async forwardReattachReplay(
     appPtyId: string,
     data: string,
@@ -2332,29 +2336,36 @@ export class SshRelaySession {
     if (!shouldContinue()) {
       return
     }
-    // Why composed here: the pty:replay drain writes data verbatim, so the snapshot
-    // carries its scrollback/alt-screen choreography from the shared builders.
+    // Why raw buffers: the drain clears before replay by default, so scrollback
+    // and frame need no prologue; the snapshot's own alt/kitty/escape proof
+    // travels in meta for the pane-aware drain to apply.
     const snapshotData = snapshot
-      ? ABORT_TRUNCATED_CONTROL_STRING +
-        buildSnapshotReplayPrologue({
-          targetAlternateScreen: false,
-          paneOnAlternateScreen: true
-        }) +
-        (snapshot.scrollbackAnsi ?? '') +
-        (snapshot.alternateScreen
-          ? buildSnapshotReplayPrologue({
-              targetAlternateScreen: true,
-              paneOnAlternateScreen: false
-            })
-          : '') +
-        snapshot.data
+      ? ABORT_TRUNCATED_CONTROL_STRING + (snapshot.scrollbackAnsi ?? '') + snapshot.data
       : data
+    const meta: SshReattachModelReplayMeta | undefined = snapshot
+      ? {
+          ...(snapshot.alternateScreen !== undefined
+            ? { alternateScreen: snapshot.alternateScreen }
+            : {}),
+          ...(snapshot.terminalOwner ? { terminalOwner: snapshot.terminalOwner } : {}),
+          ...(snapshot.pendingEscapeTailAnsi
+            ? { pendingEscapeTailAnsi: snapshot.pendingEscapeTailAnsi }
+            : {}),
+          ...(snapshot.kittyKeyboardFlags !== undefined && snapshot.seq !== undefined
+            ? { kittyKeyboardFlags: snapshot.kittyKeyboardFlags, snapshotSeq: snapshot.seq }
+            : {}),
+          ...(snapshot.cols !== undefined && snapshot.rows !== undefined
+            ? { snapshotCols: snapshot.cols, snapshotRows: snapshot.rows }
+            : {})
+        }
+      : undefined
     const win = this.getMainWindow()
     if (win && !win.isDestroyed()) {
-      // Why no replay meta: the drain clears before replay by default, the snapshot is
-      // serialized at the PTY's own grid, kitty re-arms by scanning the bytes, and
-      // alt-screen choreography is composed in-band above.
-      win.webContents.send('pty:replay', { id: appPtyId, data: snapshotData })
+      win.webContents.send('pty:replay', {
+        id: appPtyId,
+        data: snapshotData,
+        ...(meta ? { meta } : {})
+      })
     }
   }
 
@@ -2725,10 +2736,6 @@ export class SshRelaySession {
           getSshPtyConsumerRecovery(this.targetId)?.checkpointsByAppPtyId.delete(appPtyId)
           getSshPtyConsumerRecovery(this.targetId)?.checkpointsByAppPtyId.delete(ptyId)
         }
-        while (pendingReattach.queuedData.length > 0) {
-          await this.acceptPtyData(pendingReattach.queuedData.shift()!)
-        }
-        pendingReattach.livePassthrough = true
       }
       const exitAfterActivation = pendingReattach.exits.find(
         (exit) =>
@@ -2747,6 +2754,15 @@ export class SshRelaySession {
           restoringExpiredDelivery,
           () => shouldContinue() && this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)
         )
+      }
+      // Why after the replay: the replay paints the older missed tail, so
+      // attach-window bytes quarantined during the attach must land after it,
+      // not before — draining first lets the clearing snapshot erase them.
+      if (targetedDeliveryRecovery || restoringExpiredDelivery) {
+        while (pendingReattach.queuedData.length > 0) {
+          await this.acceptPtyData(pendingReattach.queuedData.shift()!)
+        }
+        pendingReattach.livePassthrough = true
       }
       if (!shouldContinue() || !this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)) {
         return
