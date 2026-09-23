@@ -12,7 +12,7 @@ import { forgetRelayNodePtyRepairs, recoverRelayNodePtyForSpawn } from './ssh-re
 import type { TerminalUnavailableCause } from '../../shared/terminal-unavailable-cause'
 import {
   ABORT_TRUNCATED_CONTROL_STRING,
-  type SshReattachModelReplayMeta
+  type SshReattachModelSnapshot
 } from '../../shared/terminal-mode-reset-profiles'
 import { DESKTOP_TERMINAL_SCROLLBACK_ROWS_MAX } from '../../shared/terminal-scrollback-policy'
 import { replayPendingSshPtyKills } from './ssh-pending-pty-kill-replay'
@@ -2310,11 +2310,10 @@ export class SshRelaySession {
     }
   }
 
-  /** Replay the missed tail after an expired-checkpoint reattach. Why data+meta
-   *  instead of composed bytes: the renderer's replay drain owns every
-   *  pane-conditional decision (clear, source-grid resize, kitty re-arm,
-   *  post-replay reset, escape tail), so main ships raw buffers plus the
-   *  snapshot's proof and never assumes which buffer the pane is on. */
+  /** Replay the missed tail after an expired-checkpoint reattach. Why a snapshot
+   *  instead of composed bytes: the renderer paints it through the canonical
+   *  snapshot path with the pane's real buffer state, so main never assumes
+   *  which buffer the pane is on. */
   private async forwardReattachReplay(
     appPtyId: string,
     data: string,
@@ -2336,27 +2335,29 @@ export class SshRelaySession {
     if (!shouldContinue()) {
       return
     }
-    // Why raw buffers: the drain clears before replay by default, so scrollback
-    // and frame need no prologue; the snapshot's own alt/kitty/escape proof
-    // travels in meta for the pane-aware drain to apply.
+    // Why raw fallback: a pane without the snapshot paint path (shutdown
+    // suspension) still gets the buffers; the snapshot carries the proof.
     const snapshotData = snapshot
       ? ABORT_TRUNCATED_CONTROL_STRING + (snapshot.scrollbackAnsi ?? '') + snapshot.data
       : data
-    const meta: SshReattachModelReplayMeta | undefined = snapshot
+    const modelSnapshot: SshReattachModelSnapshot | undefined = snapshot
       ? {
+          data: snapshot.data,
+          ...(snapshot.scrollbackAnsi ? { scrollbackAnsi: snapshot.scrollbackAnsi } : {}),
+          ...(snapshot.frameRestoreAnsi ? { frameRestoreAnsi: snapshot.frameRestoreAnsi } : {}),
+          cols: snapshot.cols,
+          rows: snapshot.rows,
+          ...(snapshot.seq !== undefined ? { seq: snapshot.seq } : {}),
           ...(snapshot.alternateScreen !== undefined
             ? { alternateScreen: snapshot.alternateScreen }
             : {}),
-          ...(snapshot.terminalOwner ? { terminalOwner: snapshot.terminalOwner } : {}),
           ...(snapshot.pendingEscapeTailAnsi
             ? { pendingEscapeTailAnsi: snapshot.pendingEscapeTailAnsi }
             : {}),
-          ...(snapshot.kittyKeyboardFlags !== undefined && snapshot.seq !== undefined
-            ? { kittyKeyboardFlags: snapshot.kittyKeyboardFlags, snapshotSeq: snapshot.seq }
+          ...(snapshot.kittyKeyboardFlags !== undefined
+            ? { kittyKeyboardFlags: snapshot.kittyKeyboardFlags }
             : {}),
-          ...(snapshot.cols !== undefined && snapshot.rows !== undefined
-            ? { snapshotCols: snapshot.cols, snapshotRows: snapshot.rows }
-            : {})
+          ...(snapshot.terminalOwner ? { terminalOwner: snapshot.terminalOwner } : {})
         }
       : undefined
     const win = this.getMainWindow()
@@ -2364,7 +2365,7 @@ export class SshRelaySession {
       win.webContents.send('pty:replay', {
         id: appPtyId,
         data: snapshotData,
-        ...(meta ? { meta } : {})
+        ...(modelSnapshot ? { snapshot: modelSnapshot } : {})
       })
     }
   }

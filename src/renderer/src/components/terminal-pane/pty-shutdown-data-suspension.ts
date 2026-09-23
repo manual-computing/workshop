@@ -1,14 +1,11 @@
 import { clearPreHandlerPtyState, drainPreHandlerPtyData } from './pty-pre-handler-buffer'
 import type { PtyDataMeta } from './pty-dispatcher'
-import type { SshReattachModelReplayMeta } from '../../../../shared/terminal-mode-reset-profiles'
+import type { SshReattachModelSnapshot } from '../../../../shared/terminal-mode-reset-profiles'
 import { PtyShutdownOutputQueue, type PtyShutdownOutputEvent } from './pty-shutdown-output-queue'
 
 export const ptyDataHandlers = new Map<string, (data: string, meta?: PtyDataMeta) => void>()
 export const ptyDataSidecars = new Map<string, Set<(data: string) => void>>()
-export const ptyReplayHandlers = new Map<
-  string,
-  (data: string, meta?: SshReattachModelReplayMeta) => void
->()
+export const ptyReplayHandlers = new Map<string, (data: string, snapshot?: SshReattachModelSnapshot) => void>()
 export const ptyExitHandlers = new Map<string, (code: number) => void>()
 export const ptyTeardownHandlers = new Map<string, () => void>()
 export const ptyShutdownLifecycleHandlers = new Map<

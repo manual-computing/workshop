@@ -2,6 +2,7 @@ import { createTerminalStartupTiming } from '../terminal-startup-timing'
 import type { PtyReplayDataMeta } from '../pty-transport'
 import type { PtyTransportRecoveryState } from '../pty-transport-types'
 import type { PtyDataMeta } from '../pty-dispatcher'
+import type { SshReattachModelSnapshot } from '../../../../../shared/terminal-mode-reset-profiles'
 import type { PtyPaneStartup } from '../pty-connection-types'
 
 import type { ConnectPanePtySession } from './connect-pane-pty-session'
@@ -70,6 +71,12 @@ export function bindCaptureTransportOutputCallbacks(session: ConnectPanePtySessi
         onReplayData: (data: string, meta?: PtyReplayDataMeta): void => {
           if (isCurrent()) {
             session.replayDataCallback(data, meta, generation)
+          }
+        },
+        onModelSnapshotReplay: (snapshot: SshReattachModelSnapshot): void => {
+          if (isCurrent()) {
+            // The paint fences on generation/identity inside; a raced teardown must not surface to IPC.
+            void session.applyMainBufferSnapshot(snapshot).catch(() => {})
           }
         },
         onError: (message: string): void => {

@@ -154,10 +154,10 @@ completed output with scrollback intact. The bounded relay tail can repeat
 older lines and cannot recover bytes it no longer retains; keep the relay
 bundle and its content-derived version around live PTYs.
 
-Two ordering rules came out of review and are pinned by unit tests. The
-replay (older missed tail) is painted before the attach-window queue is
-drained, so the clearing snapshot cannot erase newer bytes. And main ships
-raw buffers plus the snapshot's proof (`SshReattachModelReplayMeta`) instead
-of composed bytes — every pane-conditional decision (clear, source-grid
-resize, kitty re-arm, post-replay reset, escape tail) runs in the renderer's
-replay drain, which is the only side that knows which buffer the pane is on.
+Two ordering rules came out of review and are pinned by unit tests: the replay
+(older missed tail) is painted before the attach-window queue is drained, so
+the clearing snapshot cannot erase newer bytes. And main ships
+the model snapshot itself instead of composed bytes — the renderer paints it
+through the canonical snapshot path (`applyMainBufferSnapshot`) with the
+pane's real buffer state, so no alt-screen choreography is ever assumed
+main-side.

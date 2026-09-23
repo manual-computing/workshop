@@ -179,9 +179,7 @@ function attachPtySecondaryPushListeners(unsubscribes: (() => void)[]): void {
       if (bufferPtyShutdownReplayData(payload.id, payload.data)) {
         return
       }
-      // Why meta passthrough: expired-checkpoint reattach replays ship the model
-      // snapshot's proof alongside raw buffers; the pane-aware drain applies it.
-      ptyReplayHandlers.get(payload.id)?.(payload.data, payload.meta)
+      ptyReplayHandlers.get(payload.id)?.(payload.data, payload.snapshot)
     })
   )
   unsubscribes.push(

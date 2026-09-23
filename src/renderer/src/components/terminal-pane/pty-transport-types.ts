@@ -13,6 +13,7 @@ import type { EventProps } from '../../../../shared/telemetry-events'
 import type { TerminalOscColorQueryReplyColors } from '../../../../shared/terminal-osc-color-reply'
 import type { TuiAgent } from '../../../../shared/tui-agent'
 import type { ExecutionHostId } from '../../../../shared/execution-host'
+import type { SshReattachModelSnapshot } from '../../../../shared/terminal-mode-reset-profiles'
 import type { PtyDataMeta } from './pty-dispatcher'
 import type { RemoteRuntimeSnapshotOutcome } from '../../runtime/remote-runtime-terminal-multiplexer'
 import type { PtyPreconnectInputEntry } from './pty-preconnect-input-buffer'
@@ -121,6 +122,7 @@ type PtyCallbacks = {
   onDisconnect?: () => void
   onData?: (data: string, meta?: PtyDataMeta) => void
   onReplayData?: (data: string, meta?: PtyReplayDataMeta) => void
+  onModelSnapshotReplay?: (snapshot: SshReattachModelSnapshot) => void
   onStatus?: (shell: string) => void
   onError?: (message: string, errors?: string[]) => void
   onErrorCleared?: (message: string) => void

@@ -17,7 +17,7 @@ import type { TerminalViewAttributes } from '../../shared/terminal-view-attribut
 import type { TuiAgent } from '../../shared/tui-agent'
 import type { PtyManagementApi } from './pty-management-api'
 import type { TerminalProcessInspection } from '../../shared/terminal-process-inspection'
-import type { SshReattachModelReplayMeta } from '../../shared/terminal-mode-reset-profiles'
+import type { SshReattachModelSnapshot } from '../../shared/terminal-mode-reset-profiles'
 
 export type PtyApi = {
   spawn: (opts: {
@@ -196,7 +196,7 @@ export type PtyApi = {
     }) => void
   ) => () => void
   onReplay: (
-    callback: (data: { id: string; data: string; meta?: SshReattachModelReplayMeta }) => void
+    callback: (data: { id: string; data: string; snapshot?: SshReattachModelSnapshot }) => void
   ) => () => void
   /** Out-of-band main→renderer signal that renderer-bound bytes were
    *  dropped (hidden-delivery gate / pending cap); the pane restores from
