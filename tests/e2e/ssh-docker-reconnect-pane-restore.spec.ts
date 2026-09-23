@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { test, expect } from './helpers/orca-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
@@ -10,16 +11,42 @@ import {
 import {
   cleanupDockerSshRelayTarget,
   enableDockerSshRelayTargetShellTitle,
+  execDockerSshRelayTargetControlCommand,
   startDockerSshRelayTarget,
   type DockerSshRelayTarget
 } from './helpers/docker-ssh-relay-target'
 import {
   connectDockerSshRelayTarget,
+  disconnectDockerSshRelayTarget,
+  reconnectDisconnectedDockerSshRelayTarget,
   reconnectDockerSshRelayTarget
 } from './helpers/docker-ssh-relay-connection'
 import { openTerminalTabInActiveGroup } from './helpers/terminal-tab-open'
 
 const RUN_DOCKER_SSH = process.env.ORCA_E2E_SSH_DOCKER === '1'
+async function reconnectAfterExpiry(
+  orcaPage: Parameters<typeof reconnectDisconnectedDockerSshRelayTarget>[0],
+  target: DockerSshRelayTarget,
+  targetId: string,
+  completionFile: string,
+  ptyId: string
+): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        execDockerSshRelayTargetControlCommand(
+          target,
+          `test -f '${completionFile}' && printf complete || printf waiting`
+        ),
+      { timeout: 15_000 }
+    )
+    .toBe('complete')
+  // Exercise owner/delivery expiry, not the short-disconnect checkpoint path.
+  await delay(35_000)
+  await reconnectDisconnectedDockerSshRelayTarget(orcaPage, targetId)
+  await waitForActiveTerminalManager(orcaPage, 60_000)
+  expect(await waitForActivePanePtyId(orcaPage, 60_000)).toBe(ptyId)
+}
 
 /**
  * The two regressions this covers both shipped and both reached a user, because nothing here
@@ -156,6 +183,57 @@ test.describe('SSH reconnect pane restore', () => {
       if (target) {
         cleanupDockerSshRelayTarget(target)
       }
+    }
+  })
+  test('restores completed offline output without losing history older than the relay tail', async ({
+    orcaPage
+  }, testInfo) => {
+    test.slow()
+    const target = startDockerSshRelayTarget(testInfo)
+    try {
+      await waitForSessionReady(orcaPage)
+      await waitForActiveWorktree(orcaPage)
+      const remote = await connectDockerSshRelayTarget(orcaPage, target)
+      await ensureTerminalVisible(orcaPage, 45_000)
+      await waitForActiveTerminalManager(orcaPage, 60_000)
+      const ptyId = await waitForActivePanePtyId(orcaPage, 60_000)
+      const nonce = String(Date.now())
+      const history = `RETAINED_HISTORY_${nonce}`
+      const finished = `OFFLINE_FINISHED_${nonce}`
+      const completionFile = `/tmp/orca-offline-complete-${nonce}`
+      // Keep the sentinel in xterm's history but outside the relay's 100 KiB byte tail.
+      await execInTerminal(
+        orcaPage,
+        ptyId,
+        `printf '${history}\\n'; for i in {1..2000}; do printf '%060d\\n' "$i"; done`
+      )
+      await waitForTerminalOutput(orcaPage, history, 30_000, 300000)
+      await waitForTerminalOutput(orcaPage, '2000'.padStart(60, '0'), 30_000)
+      await execInTerminal(
+        orcaPage,
+        ptyId,
+        `sleep 3; printf '\\033[2J\\033[HOFFLINE_FINISHED_%s\\n' '${nonce}'; touch '${completionFile}'`
+      )
+      await disconnectDockerSshRelayTarget(orcaPage, remote.targetId)
+      await reconnectAfterExpiry(orcaPage, target, remote.targetId, completionFile, ptyId)
+      await waitForTerminalOutput(orcaPage, finished, 30_000)
+      expect(await getTerminalContent(orcaPage, 300000)).toContain(history)
+      await execInTerminal(orcaPage, ptyId, "printf 'LIVE_AFTER_%s\\n' EXPIRED_RECONNECT")
+      await waitForTerminalOutput(orcaPage, 'LIVE_AFTER_EXPIRED_RECONNECT', 30_000)
+      const altFinished = `ALT_OFFLINE_FINISHED_${nonce}`
+      const altCompletionFile = `${completionFile}-alt`
+      await execInTerminal(
+        orcaPage,
+        ptyId,
+        `printf '\\033[?1049h\\033[2J\\033[HALT_BEFORE_%s\\n' DISCONNECT; sleep 3; printf '\\033[?1049lALT_OFFLINE_FINISHED_%s\\n' '${nonce}'; touch '${altCompletionFile}'`
+      )
+      await waitForTerminalOutput(orcaPage, 'ALT_BEFORE_DISCONNECT', 30_000)
+      await disconnectDockerSshRelayTarget(orcaPage, remote.targetId)
+      await reconnectAfterExpiry(orcaPage, target, remote.targetId, altCompletionFile, ptyId)
+      await waitForTerminalOutput(orcaPage, altFinished, 30_000)
+      expect(await getTerminalContent(orcaPage, 300000)).toContain(history)
+    } finally {
+      cleanupDockerSshRelayTarget(target)
     }
   })
 })

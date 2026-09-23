@@ -10,6 +10,11 @@ import { isRelayVersionMismatchError } from './ssh-relay-version-mismatch-error'
 import { isRelayEndpointHeldError } from './ssh-relay-endpoint-incumbent'
 import { forgetRelayNodePtyRepairs, recoverRelayNodePtyForSpawn } from './ssh-relay-node-pty-repair'
 import type { TerminalUnavailableCause } from '../../shared/terminal-unavailable-cause'
+import {
+  ABORT_TRUNCATED_CONTROL_STRING,
+  buildSnapshotReplayPrologue
+} from '../../shared/terminal-mode-reset-profiles'
+import { DESKTOP_TERMINAL_SCROLLBACK_ROWS_MAX } from '../../shared/terminal-scrollback-policy'
 import { replayPendingSshPtyKills } from './ssh-pending-pty-kill-replay'
 import { sweepOrphanedRelayPtys } from './ssh-orphan-relay-pty-sweep'
 import { SshChannelMultiplexer } from './ssh-channel-multiplexer'
@@ -206,6 +211,11 @@ type RemoteCliBridgeEnv = {
 
 type ExpectedPtyIdentity = { paneKey?: string; tabId?: string }
 type TargetedDeliveryRecovery = 'confirm-existing' | 'fresh-activation'
+type ActivationLease = SshPtyAttachResult['sourceActivationLease']
+type ExpiredCheckpointRetry =
+  | { retried: true; attachResult: SshPtyAttachResult; sourceActivationLease: ActivationLease }
+  | { retried: false; sourceActivationLease: ActivationLease }
+  | undefined
 
 function expectedIdentityForLease(lease: {
   tabId?: string
@@ -2301,13 +2311,50 @@ export class SshRelaySession {
     }
   }
 
-  private forwardReattachReplay(appPtyId: string, data: string): void {
+  private async forwardReattachReplay(
+    appPtyId: string,
+    data: string,
+    preserveHistory: boolean,
+    shouldContinue: () => boolean
+  ): Promise<void> {
     if (!data) {
       return
     }
+    if (preserveHistory && this.runtime) {
+      await this.runtime.restoreSshPtyModelReplay(appPtyId, data)
+    }
+    const snapshot =
+      preserveHistory && this.runtime
+        ? await this.runtime.serializeHiddenOutputRecoveryBuffer(appPtyId, {
+            scrollbackRows: DESKTOP_TERMINAL_SCROLLBACK_ROWS_MAX
+          })
+        : null
+    if (!shouldContinue()) {
+      return
+    }
+    // Why composed here: the pty:replay drain writes data verbatim, so the snapshot
+    // carries its scrollback/alt-screen choreography from the shared builders.
+    const snapshotData = snapshot
+      ? ABORT_TRUNCATED_CONTROL_STRING +
+        buildSnapshotReplayPrologue({
+          targetAlternateScreen: false,
+          paneOnAlternateScreen: true
+        }) +
+        (snapshot.scrollbackAnsi ?? '') +
+        (snapshot.alternateScreen
+          ? buildSnapshotReplayPrologue({
+              targetAlternateScreen: true,
+              paneOnAlternateScreen: false
+            })
+          : '') +
+        snapshot.data
+      : data
     const win = this.getMainWindow()
     if (win && !win.isDestroyed()) {
-      win.webContents.send('pty:replay', { id: appPtyId, data })
+      // Why no replay meta: the drain clears before replay by default, the snapshot is
+      // serialized at the PTY's own grid, kitty re-arms by scanning the bytes, and
+      // alt-screen choreography is composed in-band above.
+      win.webContents.send('pty:replay', { id: appPtyId, data: snapshotData })
     }
   }
 
@@ -2417,6 +2464,61 @@ export class SshRelaySession {
     })
   }
 
+  private async reattachWithoutExpiredCheckpoint(args: {
+    ptyProvider: SshPtyProvider
+    ptyId: string
+    expectedIdentity: ExpectedPtyIdentity | undefined
+    sourceActivationLease: ActivationLease
+    appPtyId: string
+    pendingReattach: PendingPtyReattach
+    previousIncarnation: string | undefined
+    shouldContinue: () => boolean
+  }): Promise<ExpiredCheckpointRetry> {
+    const {
+      ptyProvider,
+      ptyId,
+      expectedIdentity,
+      sourceActivationLease,
+      appPtyId,
+      pendingReattach,
+      previousIncarnation,
+      shouldContinue
+    } = args
+    if (sourceActivationLease && !(await sourceActivationLease.rollback())) {
+      throw sourceRecoveryCancellationError(
+        new Error('ssh_source_activation_cancellation_unproven')
+      )
+    }
+    if (!shouldContinue() || !this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)) {
+      return { retried: false, sourceActivationLease: undefined }
+    }
+    // Expiry retires delivery, not the PTY; reopen the stream without the rejected checkpoint.
+    const attachResult = await this.attachPtyWithRetry(
+      ptyProvider,
+      ptyId,
+      expectedIdentity,
+      undefined,
+      shouldContinue
+    )
+    const owner = this.activePtyConsumerOwner()
+    if (
+      !shouldContinue() ||
+      !this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach) ||
+      attachResult.sourceRecovery ||
+      (previousIncarnation && attachResult.incarnationId !== previousIncarnation) ||
+      !owner?.outputFlowControl ||
+      attachResult.sourceActivation?.clientGeneration !== owner.clientGeneration ||
+      attachResult.sourceActivation.ownerGeneration !== owner.ownerGeneration
+    ) {
+      return { retried: false, sourceActivationLease: attachResult.sourceActivationLease }
+    }
+    return {
+      retried: true,
+      attachResult,
+      sourceActivationLease: attachResult.sourceActivationLease
+    }
+  }
+
   private async reattachKnownPty(args: {
     ptyProvider: SshPtyProvider
     ptyId: string
@@ -2453,24 +2555,48 @@ export class SshRelaySession {
       activated: false
     }
     this.pendingPtyReattaches.set(appPtyId, pendingReattach)
-    let sourceActivationLease: SshPtyAttachResult['sourceActivationLease']
+    let sourceActivationLease: ActivationLease
     let recoveryActivationLease: SshPtyRecoveryActivationLease | undefined
+    let restoringExpiredDelivery = false
     try {
-      const recoveryRequest =
+      const requestedRecovery =
         targetedDeliveryRecovery === 'fresh-activation'
           ? undefined
           : await this.sourceRecoveryRequest(appPtyId)
-      const attachResult = await this.attachPtyWithRetry(
+      const firstAttach = await this.attachPtyWithRetry(
         ptyProvider,
         ptyId,
         expectedIdentityByPtyId.get(ptyId),
-        recoveryRequest,
+        requestedRecovery,
         shouldContinue
       )
-      sourceActivationLease = attachResult.sourceActivationLease
+      sourceActivationLease = firstAttach.sourceActivationLease
       if (!shouldContinue()) {
         return
       }
+      const retryOutcome =
+        firstAttach.sourceRecovery?.status === 'restoreRequired' &&
+        !this.findExactPendingExit(pendingReattach, firstAttach.incarnationId)
+          ? await this.reattachWithoutExpiredCheckpoint({
+              ptyProvider,
+              ptyId,
+              expectedIdentity: expectedIdentityByPtyId.get(ptyId),
+              sourceActivationLease,
+              appPtyId,
+              pendingReattach,
+              previousIncarnation: firstAttach.incarnationId,
+              shouldContinue
+            })
+          : undefined
+      if (retryOutcome) {
+        sourceActivationLease = retryOutcome.sourceActivationLease
+        if (!retryOutcome.retried) {
+          return
+        }
+        restoringExpiredDelivery = true
+      }
+      const attachResult = retryOutcome?.retried ? retryOutcome.attachResult : firstAttach
+      const recoveryRequest = retryOutcome?.retried ? undefined : requestedRecovery
       const exitDuringAttach = pendingReattach.exits.find(
         (exit) =>
           !exit.incarnationId ||
@@ -2592,8 +2718,8 @@ export class SshRelaySession {
       pendingReattach.activated = true
       recoveryActivationLease?.commit()
       recoveryActivationLease = undefined
-      if (targetedDeliveryRecovery) {
-        if (targetedDeliveryRecovery === 'fresh-activation') {
+      if (targetedDeliveryRecovery || restoringExpiredDelivery) {
+        if (targetedDeliveryRecovery === 'fresh-activation' || restoringExpiredDelivery) {
           this.retiredSourceDeliveries.activate(ptyId)
           this.sourceIdentityByRelayPtyId.delete(ptyId)
           getSshPtyConsumerRecovery(this.targetId)?.checkpointsByAppPtyId.delete(appPtyId)
@@ -2615,7 +2741,15 @@ export class SshRelaySession {
         return
       }
       if (!recoveryRequest && !targetedDeliveryRecovery) {
-        this.forwardReattachReplay(appPtyId, attachResult.replay ?? '')
+        await this.forwardReattachReplay(
+          appPtyId,
+          attachResult.replay ?? '',
+          restoringExpiredDelivery,
+          () => shouldContinue() && this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)
+        )
+      }
+      if (!shouldContinue() || !this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)) {
+        return
       }
       sourceActivationLease?.commit()
       sourceActivationLease = undefined

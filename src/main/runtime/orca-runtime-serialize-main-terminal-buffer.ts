@@ -9,6 +9,31 @@ import {
 } from './terminal-tail-restore-seed'
 
 export class OrcaRuntimeWithSerializeMainTerminalBuffer extends OrcaRuntimeWithAttachRemoteTerminalSourceRangeConsumer {
+  async restoreSshPtyModelReplay(ptyId: string, replay: string): Promise<void> {
+    let state = this.headlessTerminals.get(ptyId)
+    if (!state) {
+      this.seedHeadlessTerminal(ptyId, replay)
+      state = this.headlessTerminals.get(ptyId)
+      if (!state) {
+        return
+      }
+    } else {
+      const retained = state
+      // The relay tail can overlap history; never replace the retained model with that bounded tail.
+      state.writeChain = state.writeChain.then(async () => {
+        if (this.headlessTerminals.get(ptyId) !== retained) {
+          return
+        }
+        retained.ownership.scan(replay)
+        await retained.emulator.write(`\x1b[2J\x1b[H${replay}`)
+      })
+    }
+    await state.writeChain
+    if (this.headlessTerminals.get(ptyId) === state) {
+      this.headlessHydrationState.set(ptyId, 'done')
+    }
+  }
+
   serializeMainTerminalBuffer(
     ptyId: string,
     opts: { scrollbackRows?: number } = {}
@@ -47,6 +72,7 @@ export class OrcaRuntimeWithSerializeMainTerminalBuffer extends OrcaRuntimeWithA
     scrollbackAnsi?: string
     pendingEscapeTailAnsi?: string
     terminalOwner?: 'shell'
+    kittyKeyboardFlags?: number
   } | null> {
     const restoredSnapshot = await this.serializePreferredRestoredTerminalBuffer(ptyId, opts)
     if (restoredSnapshot) {

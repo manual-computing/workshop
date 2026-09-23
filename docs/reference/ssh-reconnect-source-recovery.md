@@ -145,3 +145,11 @@ deterministic; the liveness gap is recorded here instead.
 Worth checking first, since it is the same shape as everything else in this file: the tab is absent
 from the host snapshot, so whatever drives the per-tab reattach after an apply may simply not know to
 reattach a tab the snapshot never mentioned.
+
+## Expired-checkpoint app recovery
+
+If detached recovery state expires while the PTY keeps writing, reconnecting
+no longer leaves the terminal detached: the app re-attaches and replays the
+completed output with scrollback intact. The bounded relay tail can repeat
+older lines and cannot recover bytes it no longer retains; keep the relay
+bundle and its content-derived version around live PTYs.

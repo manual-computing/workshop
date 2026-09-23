@@ -696,20 +696,22 @@ describe('SshRelaySession recovery race fencing', () => {
     expect(acceptOutputDataMock).toHaveBeenCalledOnce()
 
     // The pre-migration identity is gone from the intake, so only the checkpoint
-    // recorded after recovery can answer the next reconnect.
+    // recorded after recovery can answer the next reconnect. The daemon rejects it
+    // as expired, and the retry reopens the same stream without it.
     vi.mocked(getSshPtyAcceptedSourceCheckpoints).mockReturnValue([])
+    attachForReconnectMock.mockClear()
     attachForReconnectMock.mockResolvedValue({
       incarnationId: 'incarnation-1',
       sourceRecovery: { status: 'restoreRequired', reason: 'checkpointUnavailable' }
     })
+    acceptOutputDataMock.mockClear()
     await session.reconnect(deps.mockConn)
-
     expect(attachForReconnectMock).toHaveBeenCalledTimes(2)
-    expect(attachForReconnectMock.mock.calls.at(-1)?.[2]).toMatchObject({
-      status: 'checkpoint',
-      deliveryToken: 'new-token',
-      acceptedSourceEndSu: 8
-    })
+    expect(attachForReconnectMock.mock.calls[0]?.[2]).toBeDefined()
+    expect(attachForReconnectMock.mock.calls[1]?.[0]).toBe(
+      attachForReconnectMock.mock.calls[0]?.[0]
+    )
+    expect(attachForReconnectMock.mock.calls[1]?.[2]).toBeUndefined()
   })
 
   it('keeps a stale overlapping recovery from canceling or mutating its replacement', async () => {
