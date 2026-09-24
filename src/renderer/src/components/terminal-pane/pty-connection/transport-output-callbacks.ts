@@ -81,10 +81,17 @@ export function bindCaptureTransportOutputCallbacks(session: ConnectPanePtySessi
             // otherwise discardTerminalOutput erases the newer bytes.
             // Nests with the reattach deferral; the queue releases at depth 0.
             session.beginReattachLiveDataDeferral(generation)
-            void session.applyMainBufferSnapshot(snapshot).then(
-              () => session.finishReattachLiveDataDeferral(isCurrent(), generation),
-              () => session.finishReattachLiveDataDeferral(false, generation)
-            )
+            // Why isCurrent() on both arms: the coordinator propagates paint
+            // task throws, so rejection on a still-current pane is real — and
+            // failing with false would poison the shared generation owner and
+            // discard the held bytes at the outer flush. A teardown failure
+            // reads false here and discards, as before.
+            const settleSnapshotDeferral = (): void => {
+              session.finishReattachLiveDataDeferral(isCurrent(), generation)
+            }
+            void session
+              .applyMainBufferSnapshot(snapshot)
+              .then(settleSnapshotDeferral, settleSnapshotDeferral)
           }
         },
         onError: (message: string): void => {
