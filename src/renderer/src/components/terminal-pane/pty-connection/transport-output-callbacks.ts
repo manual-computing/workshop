@@ -75,8 +75,16 @@ export function bindCaptureTransportOutputCallbacks(session: ConnectPanePtySessi
         },
         onModelSnapshotReplay: (snapshot: SshReattachModelSnapshot): void => {
           if (isCurrent()) {
-            // The paint fences on generation/identity inside; a raced teardown must not surface to IPC.
-            void session.applyMainBufferSnapshot(snapshot).catch(() => {})
+            // Why owned here like scheduleReplayDataDrain: the paint runs on
+            // structuralReplayCoordinator while pty:data keeps flowing, so
+            // hold attach-window bytes until the clearing paint parses —
+            // otherwise discardTerminalOutput erases the newer bytes.
+            // Nests with the reattach deferral; the queue releases at depth 0.
+            session.beginReattachLiveDataDeferral(generation)
+            void session.applyMainBufferSnapshot(snapshot).then(
+              () => session.finishReattachLiveDataDeferral(isCurrent(), generation),
+              () => session.finishReattachLiveDataDeferral(false, generation)
+            )
           }
         },
         onError: (message: string): void => {

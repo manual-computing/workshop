@@ -4,16 +4,20 @@ import { createMockDeps, mockDeploySuccess } from './ssh-relay-session-test-fixt
 
 const {
   acceptOutputDataMock,
+  acceptOutputExitMock,
   muxRequestMock,
   openConsumerSessionMock,
   attachForReconnectMock,
-  ptyDataHandlerRef
+  ptyDataHandlerRef,
+  ptyExitHandlerRef
 } = vi.hoisted(() => ({
   acceptOutputDataMock: vi.fn().mockResolvedValue(undefined),
+  acceptOutputExitMock: vi.fn().mockResolvedValue(undefined),
   muxRequestMock: vi.fn(),
   openConsumerSessionMock: vi.fn(),
   attachForReconnectMock: vi.fn().mockResolvedValue({}),
-  ptyDataHandlerRef: { current: undefined as undefined | ((payload: unknown) => void) }
+  ptyDataHandlerRef: { current: undefined as undefined | ((payload: unknown) => void) },
+  ptyExitHandlerRef: { current: undefined as undefined | ((payload: unknown) => void) }
 }))
 
 vi.mock('./ssh-relay-deploy', () => ({ deployAndLaunchRelay: vi.fn() }))
@@ -22,7 +26,7 @@ vi.mock('./ssh-pty-consumer-session', () => ({
 }))
 vi.mock('../ipc/ssh-pty-output-intake-registry', () => ({
   acceptSshPtyOutputData: acceptOutputDataMock,
-  acceptSshPtyOutputExit: vi.fn().mockResolvedValue(undefined),
+  acceptSshPtyOutputExit: acceptOutputExitMock,
   allocateSshPtyProviderGeneration: vi.fn(() => 23),
   beginSshPtyOutputGenerationMigration: vi.fn(() => ({
     byPty: new Map(),
@@ -57,7 +61,10 @@ vi.mock('../providers/ssh-pty-provider', () => ({
       return () => {}
     })
     onReplay = vi.fn().mockReturnValue(() => {})
-    onExit = vi.fn().mockReturnValue(() => {})
+    onExit = vi.fn().mockImplementation((handler) => {
+      ptyExitHandlerRef.current = handler
+      return () => {}
+    })
     attachForReconnect = attachForReconnectMock
     setPtyDeliveryPauseAdapter = vi.fn()
     dispose = vi.fn()
@@ -104,6 +111,7 @@ describe('SshRelaySession expired-checkpoint replay', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     ptyDataHandlerRef.current = undefined
+    ptyExitHandlerRef.current = undefined
     attachForReconnectMock.mockResolvedValue({})
     vi.mocked(getPtyIdsForConnection).mockReturnValue([])
     vi.mocked(getSshPtyAcceptedSourceCheckpoints).mockReturnValue([])
@@ -215,5 +223,70 @@ describe('SshRelaySession expired-checkpoint replay', () => {
       'pty:replay',
       expect.objectContaining({ id: appPtyId, data: 'old-tail' })
     )
+  })
+  it('drains the missed tail and attach-window bytes before an exit during attach', async () => {
+    const targetId = 'expired-replay-exit-during-attach'
+    const { session, deps } = await prepareRecovery(targetId)
+    const appPtyId = `ssh:${targetId}@@pty-1`
+    let attachCalls = 0
+    attachForReconnectMock.mockImplementation(async () => {
+      attachCalls += 1
+      if (attachCalls === 1) {
+        return {
+          sourceRecovery: { status: 'restoreRequired', reason: 'checkpointUnavailable' },
+          sourceActivationLease: { commit: vi.fn(), rollback: async () => true }
+        }
+      }
+      // Final output produced while the retry attach is in flight, then the
+      // process exits before activation completes.
+      ptyDataHandlerRef.current?.({
+        id: appPtyId,
+        data: 'final-attach-window',
+        providerGeneration: 23,
+        ptyIncarnation: 'incarnation-1',
+        sequenceChars: 19,
+        source: {
+          relayPtyId: 'pty-1',
+          spanId: 'new-token:0:19',
+          clientGeneration: 2,
+          ownerGeneration: 2,
+          deliveryToken: 'new-token',
+          sourceStartSu: 0,
+          sourceEndSu: 19
+        }
+      })
+      ptyExitHandlerRef.current?.({
+        id: appPtyId,
+        code: 0,
+        providerGeneration: 23
+      })
+      return {
+        sourceActivation: { clientGeneration: 2, ownerGeneration: 2 },
+        sourceActivationLease: { commit: vi.fn(), rollback: async () => true },
+        replay: 'old-tail'
+      }
+    })
+    const sessionAny = session as unknown as {
+      forwardReattachReplay: (...args: never[]) => Promise<void>
+      acceptPtyData: (...args: never[]) => Promise<void>
+      acceptPtyExit: (...args: never[]) => Promise<void>
+    }
+    const replaySpy = vi.spyOn(sessionAny, 'forwardReattachReplay')
+    const acceptSpy = vi.spyOn(sessionAny, 'acceptPtyData')
+    const exitSpy = vi.spyOn(sessionAny, 'acceptPtyExit')
+    await session.reconnect(deps.mockConn)
+    // The exit must not discard the process's final output: replay(old) runs
+    // first, the queued attach-window bytes drain next, and the exit lands last.
+    expect(replaySpy).toHaveBeenCalledOnce()
+    expect(acceptOutputDataMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: 'final-attach-window' })
+    )
+    expect(acceptOutputExitMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: appPtyId, code: 0 })
+    )
+    expect(replaySpy.mock.invocationCallOrder[0]).toBeLessThan(
+      acceptSpy.mock.invocationCallOrder[0]!
+    )
+    expect(acceptSpy.mock.invocationCallOrder[0]).toBeLessThan(exitSpy.mock.invocationCallOrder[0]!)
   })
 })

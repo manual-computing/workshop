@@ -2609,16 +2609,40 @@ export class SshRelaySession {
       }
       const attachResult = retryOutcome?.retried ? retryOutcome.attachResult : firstAttach
       const recoveryRequest = retryOutcome?.retried ? undefined : requestedRecovery
-      const exitDuringAttach = pendingReattach.exits.find(
-        (exit) =>
-          !exit.incarnationId ||
-          !attachResult.incarnationId ||
-          exit.incarnationId === attachResult.incarnationId
-      )
+      // Why one matcher: exits accumulate in pendingReattach.exits throughout
+      // the reattach, so both exit sites share the predicate and both must
+      // drain the process's final output before delivering the exit.
+      const findMatchingExit = (): SshPtyExitPayload | undefined =>
+        pendingReattach.exits.find(
+          (exit) =>
+            !exit.incarnationId ||
+            !attachResult.incarnationId ||
+            exit.incarnationId === attachResult.incarnationId
+        )
+      const exitDuringAttach = findMatchingExit()
       if (exitDuringAttach && !recoveryRequest) {
         if (attachResult.incarnationId) {
           restorePtyIncarnation(appPtyId, attachResult.incarnationId)
           this.runtime?.acceptPtyIncarnationForExit(appPtyId, attachResult.incarnationId)
+        }
+        // Why before the exit: the expired-checkpoint replay is the process's
+        // missed tail and the queued bytes its final output — exiting first
+        // drops both with the pending reattach. Same split as the
+        // post-activation site below: replay only for expired delivery, drain
+        // for both targeted and expired delivery.
+        if (restoringExpiredDelivery) {
+          await this.forwardReattachReplay(
+            appPtyId,
+            attachResult.replay ?? '',
+            true,
+            () => shouldContinue() && this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)
+          )
+        }
+        if (targetedDeliveryRecovery || restoringExpiredDelivery) {
+          while (pendingReattach.queuedData.length > 0) {
+            await this.acceptPtyData(pendingReattach.queuedData.shift()!)
+          }
+          pendingReattach.livePassthrough = true
         }
         await this.acceptPtyExit(exitDuringAttach)
         return
@@ -2738,13 +2762,25 @@ export class SshRelaySession {
           getSshPtyConsumerRecovery(this.targetId)?.checkpointsByAppPtyId.delete(ptyId)
         }
       }
-      const exitAfterActivation = pendingReattach.exits.find(
-        (exit) =>
-          !exit.incarnationId ||
-          !attachResult.incarnationId ||
-          exit.incarnationId === attachResult.incarnationId
-      )
+      const exitAfterActivation = findMatchingExit()
       if (exitAfterActivation) {
+        // Why before the exit: attach-window bytes are the process's final
+        // output, and the expired-checkpoint replay is its missed tail —
+        // exiting first drops both with the pending reattach.
+        if (restoringExpiredDelivery) {
+          await this.forwardReattachReplay(
+            appPtyId,
+            attachResult.replay ?? '',
+            true,
+            () => shouldContinue() && this.ownsPtyRecoveryAttempt(appPtyId, pendingReattach)
+          )
+        }
+        if (targetedDeliveryRecovery || restoringExpiredDelivery) {
+          while (pendingReattach.queuedData.length > 0) {
+            await this.acceptPtyData(pendingReattach.queuedData.shift()!)
+          }
+          pendingReattach.livePassthrough = true
+        }
         await this.acceptPtyExit(exitAfterActivation)
         return
       }
